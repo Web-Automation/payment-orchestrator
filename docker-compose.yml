@@ -1,0 +1,116 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack:3
+    environment:
+      - SERVICES=sqs
+      - DEBUG=0
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  sqs-init:
+    image: amazon/aws-cli:2.17.0
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: [ "sh", "-c" ]
+    command:
+      - >
+        aws --endpoint-url=http://localstack:4566 sqs create-queue --queue-name payment-events || true
+
+  # 3 mock PG servers — each independently configurable at boot via env vars,
+  # and live-reconfigurable at runtime via POST /control (see mockPgServer.js)
+  # to simulate healthy / degraded / down states for failover testing.
+  mock-pg-a:
+    build: .
+    command: ["node", "mock-servers/mockPgServer.js"]
+    environment:
+      - PORT=4000
+      - GATEWAY_ID=gatewayA
+      - LATENCY_MS=30
+      - FAILURE_RATE=0
+    ports:
+      - "4001:4000"
+
+  mock-pg-b:
+    build: .
+    command: ["node", "mock-servers/mockPgServer.js"]
+    environment:
+      - PORT=4000
+      - GATEWAY_ID=gatewayB
+      - LATENCY_MS=20
+      - FAILURE_RATE=0
+    ports:
+      - "4002:4000"
+
+  mock-pg-c:
+    build: .
+    command: ["node", "mock-servers/mockPgServer.js"]
+    environment:
+      - PORT=4000
+      - GATEWAY_ID=gatewayC
+      - LATENCY_MS=40
+      - FAILURE_RATE=0
+    ports:
+      - "4003:4000"
+
+  app:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      sqs-init:
+        condition: service_completed_successfully
+      mock-pg-a:
+        condition: service_started
+      mock-pg-b:
+        condition: service_started
+      mock-pg-c:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - LOG_LEVEL=info
+      - REDIS_URL=redis://redis:6379
+      - EVENTS_DRIVER=sqs
+      - SQS_QUEUE_URL=http://localstack:4566/000000000000/payment-events
+      - SQS_ENDPOINT=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+      - GATEWAY_IDS=gatewayA,gatewayB,gatewayC
+      - GATEWAY_GATEWAYA_URL=http://mock-pg-a:4000
+      - GATEWAY_GATEWAYB_URL=http://mock-pg-b:4000
+      - GATEWAY_GATEWAYC_URL=http://mock-pg-c:4000
+      - ASR_WINDOW_SIZE=1000
+      - ASR_HEALTHY_THRESHOLD=0.92
+      - ASR_PRIOR_SUCCESS=48
+      - ASR_PRIOR_FAILURE=2
+      - HEALTH_PROBE_INTERVAL_MS=15000
+      - FAILOVER_MAX_CASCADES=2
+      - FAILOVER_LOCK_TTL_MS=10000
+      # Example capacity-aware overflow: cap gatewayA (the illustrative
+      # 0%-MDR primary) at a safe TPS buffer so it overflows to the paid
+      # secondaries above that, instead of collapsing under peak load.
+      - ROUTING_MAX_TPS_BY_GATEWAY=gatewayA:180
